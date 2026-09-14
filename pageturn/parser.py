@@ -212,13 +212,14 @@ def _classify_words(text: str, pm: PartMeasure) -> None:
 
 def _read_barline(el: ET.Element, pm: PartMeasure) -> None:
     marks = pm.__dict__.setdefault("_marks", {})
-    bl = el
-    ending = _child(bl, "ending")
+    location = el.get("location", "right")
+    ending = _child(el, "ending")
     if ending is not None:
         marks.setdefault("endings", []).append(
             (ending.get("number", "1"), ending.get("type", "start"),
-             _text(_child(ending, "time-only")) or ending.get("time-only")))
-    rep = _child(bl, "repeat")
+             _text(_child(ending, "time-only")) or ending.get("time-only"),
+             ending.get("location", location)))
+    rep = _child(el, "repeat")
     if rep is not None:
         times = int(rep.get("times", "2"))
         if rep.get("direction") == "forward":
@@ -226,8 +227,13 @@ def _read_barline(el: ET.Element, pm: PartMeasure) -> None:
         elif rep.get("direction") == "backward":
             marks["backward_repeat"] = times
     for name in ("segno", "coda", "fine"):
-        if _child(bl, name) is not None:
-            marks[name] = "segno" if name == "segno" else (True if name == "fine" else "coda")
+        if _child(el, name) is not None:
+            if name == "segno":
+                marks["segno"] = "segno"
+            elif name == "fine":
+                marks["fine"] = True
+            else:
+                marks["coda"] = "coda"
 
 
 def _read_sound(el: ET.Element, pm: PartMeasure, divisions: float,
@@ -359,12 +365,18 @@ def _merge_bars(parts: list[ParsedPart]) -> list[Bar]:
                 b.backward_repeat = marks["backward_repeat"]
             if marks.get("segno"):
                 b.segno = marks["segno"]
+                if p.id not in b.segno_parts:
+                    b.segno_parts.append(p.id)
             if marks.get("coda"):
                 b.coda = marks["coda"]
+                if p.id not in b.coda_parts:
+                    b.coda_parts.append(p.id)
             for key in ("d_coda", "ds", "dc", "fine", "to_coda"):
                 if marks.get(key):
                     setattr(b, key, True)
-            b.endings.extend(marks.get("endings", []))
+            for e in marks.get("endings", []):
+                if e not in b.endings:
+                    b.endings.append(e)
             for te in pm.tempos:
                 if te not in b.tempo_events:
                     b.tempo_events.append(te)

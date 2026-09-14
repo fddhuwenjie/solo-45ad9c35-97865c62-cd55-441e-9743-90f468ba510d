@@ -22,6 +22,8 @@ class App:
     def __init__(self, db_path: str = DEFAULT_DB):
         self.db_path = db_path
         self.conn = store.connect(db_path)
+        # in-process cache of the full analysis object, keyed (scoreId, analysisId)
+        self._full_cache: dict[tuple[int, int], dict] = {}
 
     def __call__(self, environ, start_response):
         method = environ["REQUEST_METHOD"]
@@ -135,11 +137,8 @@ class App:
         full = run_analysis(row["musicxml"], metadata)
         report = public_report(full)
         aid = store.create_analysis(self.conn, int(sid), report)
-        self._cache_full(int(sid), aid, full)
+        self._full_cache[(int(sid), aid)] = full
         return aid, report, full
-
-    def _cache_full(self, sid, aid, full):
-        self.conn.__dict__.setdefault("_full_cache", {})[(sid, aid)] = full
 
     def h_analyze(self, env, body, sid, sr):
         override = body.get("metadata") if isinstance(body, dict) else None
@@ -203,21 +202,25 @@ class App:
         full = run_analysis(score["musicxml"], json.loads(score["metadata_json"]))
         internal = full["_internal"]
         pagination = json.loads(row["pagination_json"])
-        svgs = {}
-        proposed = {}
+        svgs = []
         for part in internal["parts"]:
             pag = pagination.get(part.id, {"breaks": [], "locked": []})
             pr_data = evaluate_pagination(full, {part.id: pag})["parts"][0]
-            from .model import PartReport, PageReview, Crossing
             pr = _hydrate_report(part.id, pr_data)
-            baseline = internal["timing"]  # not needed for render
-            svgs[part.id] = render_svg(part.id, pr, pag["breaks"], proposed)
+            svgs.append(render_svg(part.id, pr, pag["breaks"], {}))
         if len(svgs) == 1:
-            data = next(iter(svgs.values())).encode("utf-8")
+            data = svgs[0].encode("utf-8")
         else:
-            data = ("<svg xmlns='http://www.w3.org/2000/svg'>" +
-                    "".join(f"<g>{s[s.index('<svg'):]}" for s in svgs.values())
-                    ).encode("utf-8")
+            # stack independent, valid SVG documents vertically
+            import re
+            bodies, offset = [], 0
+            for s in svgs:
+                h = int(re.search(r'height="(\d+)"', s).group(1))
+                inner = s[s.index(">", s.index("<svg")) + 1:s.rindex("</svg>")]
+                bodies.append(f'<g transform="translate(0,{offset})">{inner}</g>')
+                offset += h
+            data = (f'<svg xmlns="http://www.w3.org/2000/svg" width="920" '
+                    f'height="{offset}">' + "".join(bodies) + "</svg>").encode()
         sr("200 OK", [("Content-Type", "image/svg+xml; charset=utf-8")])
         return [data]
 
@@ -261,15 +264,22 @@ class App:
     # -- helpers -------------------------------------------------------------
 
     def _load_full(self, sid: int, analysis_id):
-        if analysis_id is not None:
-            cached = self.conn.__dict__.get("_full_cache", {}).get((sid, int(analysis_id)))
-            if cached is not None:
-                return cached
-            row = store.get_analysis(self.conn, int(analysis_id))
-            if row is None or row["score_id"] != sid:
-                raise HTTPError(404, "NOT_FOUND", f"分析 {analysis_id} 不属于该乐谱")
+        """Resolve the (possibly cached) full analysis for a revision request."""
         score = store.get_score(self.conn, sid)
-        return run_analysis(score["musicxml"], json.loads(score["metadata_json"]))
+        if score is None:
+            raise HTTPError(404, "NOT_FOUND", f"乐谱 {sid} 不存在")
+        if analysis_id is None:
+            return run_analysis(score["musicxml"], json.loads(score["metadata_json"]))
+        cached = self._full_cache.get((sid, int(analysis_id)))
+        if cached is not None:
+            return cached
+        row = store.get_analysis(self.conn, int(analysis_id))
+        if row is None or row["score_id"] != sid:
+            raise HTTPError(404, "NOT_FOUND", f"分析 {analysis_id} 不属于该乐谱")
+        # cache miss (e.g. another process): recompute from the stored score
+        full = run_analysis(score["musicxml"], json.loads(score["metadata_json"]))
+        self._full_cache[(sid, int(analysis_id))] = full
+        return full
 
 
 # ---------------------------------------------------------------------------

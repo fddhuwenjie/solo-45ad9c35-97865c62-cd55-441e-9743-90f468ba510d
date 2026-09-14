@@ -22,8 +22,8 @@ class Roadmap:
     issues: list[Issue] = field(default_factory=list)
     frames: list[RepeatFrame] = field(default_factory=list)
     endings: list[EndingSpan] = field(default_factory=list)
-    segnos: dict[str, int] = field(default_factory=dict)
-    codas: dict[str, int] = field(default_factory=dict)
+    segnos: dict[str, list[int]] = field(default_factory=dict)
+    codas: dict[str, list[int]] = field(default_factory=dict)
     terminated: bool = True
     numbers: dict[int, str] = field(default_factory=dict)
 
@@ -60,11 +60,16 @@ def expand(bars: list[Bar]) -> Roadmap:
     used_jumps: set[int] = set()
     to_coda_target: int | None = None
     state_seen: set[tuple] = set()
-    # current 1-based pass of each repeat frame. Initialised once at frame
-    # start; a repeat jump advances it through `next_pass`.
+    # 1-based pass currently performed inside each repeat frame
     current_pass: dict[int, int] = {}
-    next_pass: dict[int, int] = {}
-    started: set[int] = set()
+    # pending pass parked by printed bar (may cross a skipped volta block)
+    pending_at_bar: dict[int, int] = {}
+
+    def span_after(span: EndingSpan) -> int:
+        """Bar after an ending: honour a later ending starting where this one stops."""
+        later = [s.start for s in rm.endings
+                 if s.start >= span.end and s.start > span.start]
+        return min(later, default=span.end)
 
     while 0 <= i < n:
         if pass_no >= MAX_STEPS:
@@ -77,25 +82,41 @@ def expand(bars: list[Bar]) -> Roadmap:
 
         b = bars[i]
 
-        # set the pass of every frame starting at this printed bar, but only
-        # the first arrival unless a repeat jump queued a new pass
+        # a repeat jump may land exactly here (including inside an ending)
+        landed = pending_at_bar.pop(i, None)
+
+        # frame-start arrival: a pending repeat jump wins, otherwise pass 1
         for f in rm.frames:
             if f.start == i:
-                fid = id(f)
-                if fid in next_pass:
-                    current_pass[fid] = next_pass.pop(fid)
-                elif fid not in started:
-                    current_pass[fid] = 1
-                    started.add(fid)
+                if landed is not None:
+                    current_pass[id(f)] = landed
+                elif id(f) not in current_pass:
+                    current_pass[id(f)] = 1
 
-        # volta gate: play only the ending matching the frame's current pass
+        # volta gate. On the very first forward arrival the frame is unknown,
+        # so ending 1 plays; after a repeat jump the frame's pending pass
+        # decides which ending is taken.
         span = _ending_starting_at(rm.endings, i)
         if span is not None:
             frame = _frame_for_ending(rm.frames, span)
-            entry = current_pass.get(id(frame), 1) if frame is not None else counts[i] + 1
-            if not _ending_matches(span, entry):
-                i = span.end + 1
-                continue
+            if frame is not None:
+                fid = id(frame)
+                if landed is not None:
+                    current_pass[fid] = landed
+                if fid in current_pass:
+                    entry = current_pass[fid]
+                    if not _ending_matches(span, entry):
+                        if landed is not None:
+                            pending_at_bar[span_after(span)] = landed
+                        i = span_after(span)
+                        continue
+                else:
+                    current_pass[fid] = 1
+            else:
+                entry = counts[i] + 1
+                if not _ending_matches(span, entry):
+                    i = span_after(span)
+                    continue
 
         pass_no += 1
         counts[i] += 1
@@ -122,23 +143,32 @@ def expand(bars: list[Bar]) -> Roadmap:
                 fid = id(frame)
                 cur = current_pass.get(fid, 1)
                 if cur < frame.times:
-                    next_pass[fid] = cur + 1
-                    started.add(fid)
+                    pending_at_bar[frame.start] = cur + 1
                     i = frame.start
                     continue
             i += 1
             continue
 
-        # DC / DS — each printed directive fires at most once
+        # DC / DS — each printed directive fires at most once; on a later
+        # visit (e.g. while travelling from Segno toward To Coda) fall
+        # through so the To Coda / Fine logic below can still run
         if (b.dc or b.ds) and i not in used_jumps:
             kind = "ds" if b.ds else "dc"
-            if kind == "ds" and "segno" not in rm.segnos:
+            segno_targets = rm.segnos.get("segno", [])
+            if kind == "ds" and not segno_targets:
                 rm.issues.append(Issue(
                     "JUMP_TARGET_MISSING", "error", None, pass_no, b.number,
                     "D.S. 找不到 Segno 记号", break_after=b.number))
                 i += 1
                 continue
-            if b.d_coda and "coda" not in rm.codas:
+            if kind == "ds" and len(segno_targets) > 1:
+                rm.issues.append(Issue(
+                    "REPEAT_AMBIGUOUS", "error", None, pass_no, b.number,
+                    f"反复出口多解：遍次 {pass_no} 的 D.S. 对应多个 Segno"
+                    f"（小节 {', '.join(rm.mnum(t) for t in segno_targets)}），"
+                    "跳转目标不唯一",
+                    break_after=b.number))
+            if b.d_coda and not rm.codas.get("coda"):
                 rm.issues.append(Issue(
                     "JUMP_TARGET_MISSING", "error", None, pass_no, b.number,
                     "al Coda 找不到 Coda 记号", break_after=b.number))
@@ -147,8 +177,8 @@ def expand(bars: list[Bar]) -> Roadmap:
             used_jumps.add(i)
             after_jump = True
             if b.d_coda:
-                to_coda_target = rm.codas["coda"]
-            i = rm.segnos["segno"] if kind == "ds" else 0
+                to_coda_target = rm.codas["coda"][0]
+            i = segno_targets[0] if kind == "ds" else 0
             continue
 
         # To Coda after an al Coda jump
@@ -168,17 +198,28 @@ def expand(bars: list[Bar]) -> Roadmap:
 def _index_marks(bars: list[Bar], rm: Roadmap) -> None:
     for b in bars:
         if b.segno:
-            if b.segno in rm.segnos:
-                rm.issues.append(Issue(
-                    "REPEAT_AMBIGUOUS", "error", None, None, b.number,
-                    f"重复的 Segno 记号（{b.segno}），跳转目标多解"))
-            rm.segnos[b.segno] = b.index
+            rm.segnos.setdefault(b.segno, []).append(b.index)
         if b.coda:
-            if b.coda in rm.codas:
+            rm.codas.setdefault(b.coda, []).append(b.index)
+    # structural ambiguity that exists independently of the traversal
+    for name, targets in rm.segnos.items():
+        if len(targets) > 1:
+            for t in targets:
+                b = bars[t]
                 rm.issues.append(Issue(
                     "REPEAT_AMBIGUOUS", "error", None, None, b.number,
-                    f"重复的 Coda 记号（{b.coda}），跳转目标多解"))
-            rm.codas[b.coda] = b.index
+                    f"Segno 记号（{name}）在小节 "
+                    f"{', '.join(bars[x].number for x in targets)} 重复出现，"
+                    "D.S. 跳转目标多解"))
+    for name, targets in rm.codas.items():
+        if len(targets) > 1:
+            for t in targets:
+                b = bars[t]
+                rm.issues.append(Issue(
+                    "REPEAT_AMBIGUOUS", "error", None, None, b.number,
+                    f"Coda 记号（{name}）在小节 "
+                    f"{', '.join(bars[x].number for x in targets)} 重复出现，"
+                    "al Coda 跳转目标多解"))
     for b in bars:
         if b.ds and not rm.segnos:
             rm.issues.append(Issue(
@@ -212,26 +253,38 @@ def _pair_frames(bars: list[Bar], rm: Roadmap) -> None:
 
 
 def _build_ending_spans(bars: list[Bar], rm: Roadmap) -> None:
+    """Ending spans are half-open: a stop barline belongs to the next section."""
+    stop_bars: dict[str, int] = {}
     open_stack: list[EndingSpan] = []
     for b in bars:
-        for number, etype, time_only in b.endings:
+        # left-located stops in this measure end the span before this measure
+        for number, etype, time_only, location in b.endings:
+            if etype in ("stop", "discontinue") and location.startswith("left"):
+                for sp in reversed(open_stack):
+                    if sp.number == number:
+                        sp.end = b.index
+                        open_stack.remove(sp)
+                        stop_bars[number] = b.index
+                        break
+        for number, etype, time_only, location in b.endings:
             if etype == "start":
                 sp = EndingSpan(number=number, start=b.index, end=b.index,
                                 time_only=time_only)
                 open_stack.append(sp)
                 rm.endings.append(sp)
-            elif etype in ("stop", "discontinue"):
+            elif etype in ("stop", "discontinue") and not location.startswith("left"):
+                # stop on a right barline: the measure belongs to the ending
                 for sp in reversed(open_stack):
                     if sp.number == number:
-                        sp.end = b.index
+                        sp.end = b.index + 1
                         open_stack.remove(sp)
                         break
     for sp in open_stack:
-        sp.end = len(bars) - 1
+        sp.end = len(bars)
     seen: dict[str, tuple[int, int]] = {}
     for sp in rm.endings:
         prev = seen.get(sp.number)
-        if prev is not None and sp.start <= prev[1]:
+        if prev is not None and sp.start < prev[1]:
             rm.issues.append(Issue(
                 "REPEAT_AMBIGUOUS", "error", None, None,
                 bars[sp.start].number,
@@ -247,8 +300,7 @@ def _ending_starting_at(spans: list[EndingSpan], i: int) -> EndingSpan | None:
 
 
 def _frame_for_ending(frames: list[RepeatFrame], span: EndingSpan) -> RepeatFrame | None:
-    # the section is the latest repeat frame beginning at/before this ending;
-    # volta endings may sit just outside the frame's backward-repeat bar
+    # the section is the latest repeat frame beginning at/before this ending
     cands = [f for f in frames if f.start <= span.start]
     return max(cands, key=lambda f: f.start, default=None)
 

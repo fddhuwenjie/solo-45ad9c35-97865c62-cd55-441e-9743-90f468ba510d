@@ -1,14 +1,12 @@
 """Orchestration: parse -> roadmap -> timing -> pagination -> reports."""
 from __future__ import annotations
 
-import copy
 import hashlib
-from dataclasses import asdict
 
 from . import analyzer
 from .metadata import normalize_metadata
 from .model import Issue
-from .parser import parse_musicxml, get_marks
+from .parser import get_marks, parse_musicxml
 from .roadmap import expand
 
 
@@ -30,19 +28,28 @@ def run_analysis(musicxml: str, metadata: dict | None = None) -> dict:
 
     rm = expand(bars)
 
-    # pagination: explicit metadata overrides, otherwise <print new-page>
+    # repeated Segno/Coda marks are structural ambiguity: attach part, pass
+    # and measure at every D.S./al Coda directive for every affected part
+    ds_issues = _segno_ambiguity_issues(parts, bars, rm)
+
+    # pagination: explicit metadata overrides, otherwise <print new-page>.
+    # MusicXML semantics: new-page="yes" on measure N starts a page AT N, so
+    # the player turns after the preceding measure N-1.
     pagination: dict[str, dict] = {}
     for part in parts:
         explicit = meta["pagination"].get(part.id, {})
         if explicit.get("breaks"):
             breaks = explicit["breaks"]
         else:
-            breaks = [pm.number for pm in part.measures if pm.print_new_page]
+            breaks = []
+            for pm in part.measures:
+                if pm.print_new_page and pm.index > 0:
+                    breaks.append(part.measures[pm.index - 1].number)
         locked = explicit.get("locked", [])
         pagination[part.id] = {"breaks": breaks, "locked": locked}
 
     part_reports = []
-    issues = list(rm.issues)
+    issues = list(rm.issues) + ds_issues
     timing_data: dict[str, dict] = {}
     for part in parts:
         cfg = meta["parts"][part.id]
@@ -66,6 +73,7 @@ def run_analysis(musicxml: str, metadata: dict | None = None) -> dict:
         "_internal": {
             "parts": parts, "bars": bars, "roadmap": rm,
             "timing": timing_data, "meta": meta,
+            "structural_issues": ds_issues,
         },
     }
 
@@ -78,7 +86,8 @@ def evaluate_pagination(full: dict, pagination: dict) -> dict:
     rm = internal["roadmap"]
     meta = internal["meta"]
     out_parts = []
-    all_issues = list(rm.issues)
+    structural = internal.get("structural_issues", [])
+    all_issues = list(rm.issues) + structural
     for part in parts:
         cfg = meta["parts"][part.id]
         data = internal["timing"][part.id]
@@ -122,6 +131,43 @@ def confirmed_bundle(full: dict, revision_pagination: dict, digest: str) -> dict
 
 # --- helpers ------------------------------------------------------------------
 
+def _segno_ambiguity_issues(parts, bars, rm) -> list[Issue]:
+    """Locate ambiguous D.S./al Coda decisions as (part, pass, measure)."""
+    out: list[Issue] = []
+    ambiguous_segno = {name: idxs for name, idxs in rm.segnos.items() if len(idxs) > 1}
+    ambiguous_coda = {name: idxs for name, idxs in rm.codas.items() if len(idxs) > 1}
+    if not ambiguous_segno and not ambiguous_coda:
+        return out
+
+    # pass number(s) at which a directive bar is visited on the route
+    pass_at: dict[int, list[int]] = {}
+    for v in rm.route:
+        pass_at.setdefault(v.index, []).append(v.pass_no)
+
+    part_with_ds = {p.id: any(get_marks(pm).get("ds") or get_marks(pm).get("d_coda")
+                              for pm in p.measures) for p in parts}
+    for part in parts:
+        if not part_with_ds[part.id]:
+            continue
+        for b in bars:
+            marks = get_marks(part.measures[b.index])
+            if not marks.get("ds"):
+                continue
+            # the printed directive fires once: at its first route visit
+            pnos = pass_at.get(b.index, [])
+            pno = pnos[0] if pnos else None
+            if ambiguous_segno:
+                for name, idxs in ambiguous_segno.items():
+                    out.append(Issue(
+                        "REPEAT_AMBIGUOUS", "error", part.id, pno, b.number,
+                        f"声部 {part.name} 遍次 {pno} 小节 {b.number} 的 D.S. "
+                        f"对应多个 Segno（小节 "
+                        f"{', '.join(bars[x].number for x in idxs)}），"
+                        "反复出口多解，该分页断点不得判为可演奏",
+                        break_after=b.number))
+    return out
+
+
 def _part_dict(pr) -> dict:
     return {
         "partId": pr.part_id,
@@ -133,11 +179,13 @@ def _part_dict(pr) -> dict:
             {
                 "page": p.page,
                 "breakAfter": p.break_after,
+                "isTail": p.is_tail,
                 "locked": p.locked,
                 "feasible": p.feasible,
                 "reason": p.reason,
                 "gapSeconds": p.gap_seconds,
-                "measureCount": getattr(p, "measure_count", None),
+                "measureCount": p.measure_count,
+                "pageSeconds": p.page_seconds,
                 "moveTo": p.move_to,
                 "moveCandidates": p.move_candidates,
                 "crossings": [

@@ -94,10 +94,12 @@ class Bar:
     length_q: float = 4.0               # quarters, from a global time signature
     forward_repeat: Optional[int] = None   # total plays
     backward_repeat: Optional[int] = None
-    endings: list[tuple[str, str, Optional[str]]] = field(default_factory=list)
-    # (number, start|stop|discontinue, time_only)
+    endings: list[tuple[str, str, Optional[str], str]] = field(default_factory=list)
+    # (number, start|stop|discontinue, time_only, barline location)
     segno: Optional[str] = None         # usually "segno"
+    segno_parts: list[str] = field(default_factory=list)
     coda: Optional[str] = None
+    coda_parts: list[str] = field(default_factory=list)
     d_coda: bool = False                # "al Coda" directive at/after this bar
     ds: bool = False                    # D.S.
     dc: bool = False                    # D.C.
@@ -112,7 +114,7 @@ class RepeatFrame:
     end: int
     times: int                          # total plays
     current_pass: int = 1
-    pending_pass: int = 0               # >0 when a repeat jump lands next
+    pending_pass: int = 0               # queued by a repeat jump, consumed at start
 
 
 @dataclass
@@ -184,14 +186,17 @@ class Crossing:
 @dataclass
 class PageReview:
     page: int
-    break_after: str
-    locked: bool
+    break_after: Optional[str] = None   # None for the final (tail) page
+    locked: bool = False
     crossings: list[Crossing] = field(default_factory=list)
     feasible: bool = True
     reason: Optional[str] = None
     gap_seconds: Optional[float] = None
     move_to: Optional[str] = None       # proposal
     move_candidates: list[dict] = field(default_factory=list)
+    measure_count: int = 0
+    page_seconds: Optional[float] = None
+    is_tail: bool = False               # final page after the last break
 
 
 @dataclass

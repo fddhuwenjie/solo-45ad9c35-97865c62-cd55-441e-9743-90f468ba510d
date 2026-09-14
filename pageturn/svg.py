@@ -28,17 +28,20 @@ def render_svg(part_id: str, report: PartReport, baseline: list[str],
         y = 40 + (i + 1) * row_h
         color = "#1a7f37" if p.feasible else "#c0392b"
         mark = "✓ 可演奏" if p.feasible else "✗ 不可演奏"
+        if p.is_tail:
+            mark = "末页容量" + (" ✓" if p.feasible else " ✗")
         if p.locked:
             mark += "（锁定）"
         move = p.move_to or "—"
         if p.move_to:
             move = f"{p.move_to} ◀"
         gap = "—" if p.gap_seconds is None else f"{p.gap_seconds:.2f}"
+        break_label = "末页" if p.is_tail or p.break_after is None else p.break_after
         parts += [
             f'<line x1="16" y1="{y + row_h - 8}" x2="904" y2="{y + row_h - 8}" '
             'stroke="#e3e3e3"/>',
             _cell(16, y, 60, str(p.page)),
-            _cell(90, y, 200, escape(p.break_after)),
+            _cell(90, y, 200, escape(break_label)),
             _cell(330, y, 200, escape(move),
                   fill="#0b63ce" if p.move_to else None, bold=bool(p.move_to)),
             _cell(560, y, 110, gap),
